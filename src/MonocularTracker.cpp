@@ -4,13 +4,46 @@
 #include <cmath>
 #include <numeric>
 #include <sstream>
+#include <stdexcept>
 #include <vector>
 
+#include <gtsam/geometry/Pose3.h>
+#include <gtsam/inference/Symbol.h>
+#include <gtsam/nonlinear/ISAM2.h>
+#include <gtsam/nonlinear/NonlinearFactorGraph.h>
+#include <gtsam/nonlinear/Values.h>
+#include <gtsam/slam/BetweenFactor.h>
+#include <gtsam/slam/PriorFactor.h>
 #include <opencv2/imgproc.hpp>
 
 namespace vslam {
 
 namespace {
+
+gtsam::Pose3 ToGtsamPose(const cv::Matx44d& pose) {
+  gtsam::Matrix44 matrix;
+  for (int row = 0; row < 4; ++row) {
+    for (int col = 0; col < 4; ++col) {
+      matrix(row, col) = pose(row, col);
+    }
+  }
+  return gtsam::Pose3(matrix);
+}
+
+cv::Matx44d FromGtsamPose(const gtsam::Pose3& pose) {
+  const gtsam::Matrix44 matrix = pose.matrix();
+  cv::Matx44d cv_pose = cv::Matx44d::eye();
+  for (int row = 0; row < 4; ++row) {
+    for (int col = 0; col < 4; ++col) {
+      cv_pose(row, col) = matrix(row, col);
+    }
+  }
+  return cv_pose;
+}
+
+gtsam::Symbol PoseKey(int index) {
+  return gtsam::Symbol('x', static_cast<uint64_t>(index));
+}
 
 cv::Matx44d ComposePose(const cv::Mat& rotation, const cv::Mat& translation) {
   cv::Matx44d pose = cv::Matx44d::eye();
@@ -260,18 +293,6 @@ std::vector<ColoredPoint> TriangulatePositiveDepthPoints(
   return positive_depth_points;
 }
 
-std::vector<ColoredPoint> TransformPointsToWorld(const std::vector<ColoredPoint>& camera_points,
-                                                 const cv::Matx44d& T_w_c) {
-  std::vector<ColoredPoint> world_points;
-  world_points.reserve(camera_points.size());
-  for (const auto& point : camera_points) {
-    const cv::Vec4d homogeneous(point.position.x, point.position.y, point.position.z, 1.0);
-    const cv::Vec4d world = T_w_c * homogeneous;
-    world_points.push_back({cv::Point3d(world[0], world[1], world[2]), point.bgr});
-  }
-  return world_points;
-}
-
 std::string PoseSummary(const TrackingStats& stats) {
   std::ostringstream stream;
   stream.setf(std::ios::fixed);
@@ -286,10 +307,37 @@ std::string PoseSummary(const TrackingStats& stats) {
 
 }  // namespace
 
+struct MonocularTracker::FactorGraphState {
+  gtsam::ISAM2 isam;
+  gtsam::NonlinearFactorGraph pending_graph;
+  gtsam::Values pending_values;
+  gtsam::Values values;
+  gtsam::noiseModel::Diagonal::shared_ptr prior_noise;
+  gtsam::noiseModel::Diagonal::shared_ptr between_noise;
+
+  FactorGraphState() : isam([] {
+    gtsam::ISAM2Params params;
+    params.relinearizeThreshold = 0.01;
+    params.relinearizeSkip = 1;
+    return params;
+  }()) {
+    gtsam::Vector prior_sigmas(6);
+    prior_sigmas << 1e-4, 1e-4, 1e-4, 1e-4, 1e-4, 1e-4;
+    prior_noise = gtsam::noiseModel::Diagonal::Sigmas(prior_sigmas);
+
+    gtsam::Vector between_sigmas(6);
+    between_sigmas << 0.08, 0.08, 0.08, 0.12, 0.12, 0.12;
+    between_noise = gtsam::noiseModel::Diagonal::Sigmas(between_sigmas);
+  }
+};
+
 MonocularTracker::MonocularTracker(bool prefer_metal)
     : prefer_metal_(prefer_metal),
       orb_(cv::ORB::create(2800)),
-      matcher_(cv::NORM_HAMMING, false) {}
+      matcher_(cv::NORM_HAMMING, false),
+      factor_graph_(std::make_unique<FactorGraphState>()) {}
+
+MonocularTracker::~MonocularTracker() = default;
 
 bool MonocularTracker::usingMetal() const {
   return prefer_metal_ && metal_.isAvailable();
@@ -306,11 +354,122 @@ void MonocularTracker::initializeIntrinsics(const cv::Size& frame_size) {
   prev_gray_.release();
   prev_keypoints_.clear();
   prev_descriptors_.release();
-  has_active_keyframe_ = false;
+  active_keyframe_index_ = -1;
+  keyframes_.clear();
+  map_points_local_.clear();
   map_points_world_.clear();
   trajectory_history_.clear();
   trajectory_history_.emplace_back(0.0, 0.0, 0.0);
   frame_index_ = 0;
+  factor_graph_ = std::make_unique<FactorGraphState>();
+}
+
+void MonocularTracker::seedKeyframe(const cv::Mat& frame_bgr,
+                                    const std::vector<cv::KeyPoint>& keypoints,
+                                    const cv::Mat& descriptors,
+                                    const cv::Matx44d& T_w_c) {
+  Keyframe keyframe;
+  keyframe.frame_index = frame_index_;
+  keyframe.graph_index = static_cast<int>(keyframes_.size());
+  keyframe.T_w_c_initial = T_w_c;
+  keyframe.T_w_c_optimized = T_w_c;
+  keyframe.image_bgr = frame_bgr.clone();
+  keyframe.keypoints = keypoints;
+  keyframe.descriptors = descriptors.clone();
+  keyframes_.push_back(keyframe);
+  active_keyframe_index_ = keyframe.graph_index;
+
+  factor_graph_->pending_graph.add(
+      gtsam::PriorFactor<gtsam::Pose3>(PoseKey(keyframe.graph_index), ToGtsamPose(T_w_c),
+                                       factor_graph_->prior_noise));
+  factor_graph_->pending_values.insert(PoseKey(keyframe.graph_index), ToGtsamPose(T_w_c));
+  optimizePoseGraph();
+  rebuildWorldGeometry();
+}
+
+void MonocularTracker::addKeyframe(const cv::Mat& frame_bgr,
+                                   const std::vector<cv::KeyPoint>& keypoints,
+                                   const cv::Mat& descriptors,
+                                   const cv::Matx44d& T_w_c) {
+  if (active_keyframe_index_ < 0 || active_keyframe_index_ >= static_cast<int>(keyframes_.size())) {
+    seedKeyframe(frame_bgr, keypoints, descriptors, T_w_c);
+    return;
+  }
+
+  const Keyframe& previous = keyframes_[active_keyframe_index_];
+  const int new_index = static_cast<int>(keyframes_.size());
+  const gtsam::Pose3 previous_pose = ToGtsamPose(previous.T_w_c_optimized);
+  const gtsam::Pose3 current_pose = ToGtsamPose(T_w_c);
+  const gtsam::Pose3 relative_measurement = previous_pose.between(current_pose);
+
+  factor_graph_->pending_graph.add(gtsam::BetweenFactor<gtsam::Pose3>(
+      PoseKey(previous.graph_index), PoseKey(new_index), relative_measurement,
+      factor_graph_->between_noise));
+  factor_graph_->pending_values.insert(PoseKey(new_index), current_pose);
+
+  Keyframe keyframe;
+  keyframe.frame_index = frame_index_;
+  keyframe.graph_index = new_index;
+  keyframe.T_w_c_initial = T_w_c;
+  keyframe.T_w_c_optimized = T_w_c;
+  keyframe.image_bgr = frame_bgr.clone();
+  keyframe.keypoints = keypoints;
+  keyframe.descriptors = descriptors.clone();
+  keyframes_.push_back(keyframe);
+  active_keyframe_index_ = new_index;
+
+  optimizePoseGraph();
+}
+
+void MonocularTracker::optimizePoseGraph() {
+  if (!factor_graph_ || keyframes_.empty()) {
+    return;
+  }
+
+  try {
+    factor_graph_->isam.update(factor_graph_->pending_graph, factor_graph_->pending_values);
+    factor_graph_->values = factor_graph_->isam.calculateEstimate();
+    factor_graph_->pending_graph.resize(0);
+    factor_graph_->pending_values.clear();
+    for (auto& keyframe : keyframes_) {
+      const gtsam::Symbol symbol = PoseKey(keyframe.graph_index);
+      if (factor_graph_->values.exists(symbol)) {
+        keyframe.T_w_c_optimized =
+            FromGtsamPose(factor_graph_->values.at<gtsam::Pose3>(symbol));
+      }
+    }
+  } catch (const std::exception&) {
+    for (auto& keyframe : keyframes_) {
+      keyframe.T_w_c_optimized = keyframe.T_w_c_initial;
+    }
+  }
+
+  rebuildWorldGeometry();
+}
+
+void MonocularTracker::rebuildWorldGeometry() {
+  trajectory_history_.clear();
+  map_points_world_.clear();
+
+  for (const auto& keyframe : keyframes_) {
+    trajectory_history_.emplace_back(keyframe.T_w_c_optimized(0, 3), keyframe.T_w_c_optimized(1, 3),
+                                     keyframe.T_w_c_optimized(2, 3));
+  }
+  if (trajectory_history_.empty()) {
+    trajectory_history_.emplace_back(0.0, 0.0, 0.0);
+  }
+
+  map_points_world_.reserve(map_points_local_.size());
+  for (const auto& point : map_points_local_) {
+    if (point.keyframe_index < 0 || point.keyframe_index >= static_cast<int>(keyframes_.size())) {
+      continue;
+    }
+    const cv::Matx44d& T_w_c = keyframes_[point.keyframe_index].T_w_c_optimized;
+    const cv::Vec4d local(point.position_in_keyframe.x, point.position_in_keyframe.y,
+                          point.position_in_keyframe.z, 1.0);
+    const cv::Vec4d world = T_w_c * local;
+    map_points_world_.push_back({cv::Point3d(world[0], world[1], world[2]), point.bgr});
+  }
 }
 
 TrackingFrame MonocularTracker::process(const cv::Mat& frame_bgr) {
@@ -345,7 +504,7 @@ TrackingFrame MonocularTracker::process(const cv::Mat& frame_bgr) {
   result.stats.initialized = !prev_descriptors_.empty();
   result.stats.metal_enabled = metal_used;
   result.stats.keypoints = static_cast<int>(keypoints.size());
-  result.stats.keyframes = has_active_keyframe_ ? 1 : 0;
+  result.stats.keyframes = static_cast<int>(keyframes_.size());
   result.stats.status = "Bootstrapping";
   result.stats.pose_matrix = T_c_w_.inv();
 
@@ -361,14 +520,14 @@ TrackingFrame MonocularTracker::process(const cv::Mat& frame_bgr) {
     prev_gray_ = gray;
     prev_keypoints_ = keypoints;
     prev_descriptors_ = descriptors.clone();
-    if (!has_active_keyframe_ && !descriptors.empty() && keypoints.size() >= 80) {
-      active_keyframe_.frame_index = frame_index_;
-      active_keyframe_.T_w_c = T_c_w_.inv();
-      active_keyframe_.image_bgr = frame_bgr.clone();
-      active_keyframe_.keypoints = keypoints;
-      active_keyframe_.descriptors = descriptors.clone();
-      has_active_keyframe_ = true;
-      result.stats.keyframes = 1;
+    if (active_keyframe_index_ < 0 && !descriptors.empty() && keypoints.size() >= 80) {
+      seedKeyframe(frame_bgr, keypoints, descriptors, T_c_w_.inv());
+      result.stats.keyframes = static_cast<int>(keyframes_.size());
+      result.stats.map_points = static_cast<int>(map_points_world_.size());
+      result.stats.pose_matrix = keyframes_.front().T_w_c_optimized;
+      result.geometry_bgr = RenderGeometryView(map_points_world_, trajectory_history_);
+      result.world_points = map_points_world_;
+      result.trajectory_points = trajectory_history_;
       result.stats.status = "Seeded keyframe";
     }
     cv::putText(result.display_bgr, PoseSummary(result.stats), cv::Point(20, 32),
@@ -441,64 +600,60 @@ TrackingFrame MonocularTracker::process(const cv::Mat& frame_bgr) {
       cv::norm(cv::Vec3d(T_w_c(0, 3), T_w_c(1, 3), T_w_c(2, 3)));
   result.stats.pose_updated = true;
   result.stats.status = "Tracking";
-  trajectory_history_.emplace_back(T_w_c(0, 3), T_w_c(1, 3), T_w_c(2, 3));
-  if (trajectory_history_.size() > 512) {
-    trajectory_history_.erase(trajectory_history_.begin(),
-                              trajectory_history_.begin() + (trajectory_history_.size() - 512));
+
+  if (active_keyframe_index_ < 0) {
+    seedKeyframe(frame_bgr, keypoints, descriptors, T_w_c);
+    result.stats.status = "Tracking + seeded keyframe";
   }
 
-  std::vector<ColoredPoint> triangulated_world_points;
-  if (has_active_keyframe_ && !active_keyframe_.descriptors.empty()) {
+  std::vector<ColoredPoint> triangulated_keyframe_points;
+  if (active_keyframe_index_ >= 0 &&
+      active_keyframe_index_ < static_cast<int>(keyframes_.size()) &&
+      !keyframes_[active_keyframe_index_].descriptors.empty()) {
+    const Keyframe& active_keyframe = keyframes_[active_keyframe_index_];
     const std::vector<cv::DMatch> keyframe_matches =
-        RatioTestMatches(matcher_, active_keyframe_.descriptors, descriptors);
+        RatioTestMatches(matcher_, active_keyframe.descriptors, descriptors);
     std::vector<cv::Point2f> keyframe_points;
     std::vector<cv::Point2f> current_keyframe_points;
-    GatherMatchedPoints(active_keyframe_.keypoints, keypoints, keyframe_matches,
+    GatherMatchedPoints(active_keyframe.keypoints, keypoints, keyframe_matches,
                         keyframe_points, current_keyframe_points);
 
-    const cv::Matx44d T_c_k = RelativePose(active_keyframe_.T_w_c, T_w_c);
+    const cv::Matx44d T_c_k = RelativePose(active_keyframe.T_w_c_optimized, T_w_c);
     const cv::Vec3d keyframe_translation = TranslationFromPose(T_c_k);
     const double keyframe_baseline = cv::norm(keyframe_translation);
     const double keyframe_motion = MedianPixelMotion(keyframe_points, current_keyframe_points);
 
     if (keyframe_matches.size() >= 32 && keyframe_baseline > 0.12 && keyframe_motion > 14.0) {
-      const std::vector<ColoredPoint> keyframe_points_3d = TriangulatePositiveDepthPoints(
-          camera_matrix_, RotationFromPose(T_c_k), keyframe_translation, active_keyframe_.image_bgr, keyframe_points,
-          current_keyframe_points);
-      triangulated_world_points =
-          TransformPointsToWorld(keyframe_points_3d, active_keyframe_.T_w_c);
+      triangulated_keyframe_points = TriangulatePositiveDepthPoints(
+          camera_matrix_, RotationFromPose(T_c_k), keyframe_translation,
+          active_keyframe.image_bgr, keyframe_points, current_keyframe_points);
+
+      for (const auto& point : triangulated_keyframe_points) {
+        map_points_local_.push_back(
+            {active_keyframe.graph_index, point.position, point.bgr});
+      }
+      if (map_points_local_.size() > 12000) {
+        map_points_local_.erase(
+            map_points_local_.begin(),
+            map_points_local_.begin() + (map_points_local_.size() - 12000));
+      }
+      rebuildWorldGeometry();
     }
 
-    const int frames_since_keyframe = frame_index_ - active_keyframe_.frame_index;
+    const int frames_since_keyframe = frame_index_ - active_keyframe.frame_index;
     if (ShouldCreateKeyframe(frames_since_keyframe, keyframe_baseline, keyframe_motion, inlier_count)) {
-      active_keyframe_.frame_index = frame_index_;
-      active_keyframe_.T_w_c = T_w_c;
-      active_keyframe_.image_bgr = frame_bgr.clone();
-      active_keyframe_.keypoints = keypoints;
-      active_keyframe_.descriptors = descriptors.clone();
+      addKeyframe(frame_bgr, keypoints, descriptors, T_w_c);
+      T_c_w_ = keyframes_.back().T_w_c_optimized.inv();
+      result.stats.pose_matrix = keyframes_.back().T_w_c_optimized;
+      result.stats.translation_norm =
+          cv::norm(cv::Vec3d(result.stats.pose_matrix(0, 3), result.stats.pose_matrix(1, 3),
+                             result.stats.pose_matrix(2, 3)));
       result.stats.status = "Tracking + keyframe";
     }
-  } else {
-    active_keyframe_.frame_index = frame_index_;
-    active_keyframe_.T_w_c = T_w_c;
-    active_keyframe_.image_bgr = frame_bgr.clone();
-    active_keyframe_.keypoints = keypoints;
-    active_keyframe_.descriptors = descriptors.clone();
-    has_active_keyframe_ = true;
-    result.stats.status = "Tracking + seeded keyframe";
   }
 
-  if (!triangulated_world_points.empty()) {
-    for (const auto& point : triangulated_world_points) {
-      map_points_world_.push_back(point);
-    }
-  }
-  if (map_points_world_.size() > 6000) {
-    map_points_world_.erase(map_points_world_.begin(),
-                            map_points_world_.begin() + (map_points_world_.size() - 6000));
-  }
   result.stats.map_points = static_cast<int>(map_points_world_.size());
-  result.stats.keyframes = has_active_keyframe_ ? 1 : 0;
+  result.stats.keyframes = static_cast<int>(keyframes_.size());
   result.geometry_bgr = RenderGeometryView(map_points_world_, trajectory_history_);
   result.world_points = map_points_world_;
   result.trajectory_points = trajectory_history_;

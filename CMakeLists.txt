@@ -1,8 +1,12 @@
 cmake_minimum_required(VERSION 3.28)
 
+if(POLICY CMP0167)
+  cmake_policy(SET CMP0167 OLD)
+endif()
+
 project(macos-metal-vslam VERSION 0.1.0 LANGUAGES CXX OBJCXX)
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_OSX_ARCHITECTURES arm64 CACHE STRING "Build for Apple Silicon" FORCE)
@@ -12,7 +16,16 @@ if(APPLE AND EXISTS "/opt/homebrew/opt/opencv")
   list(PREPEND CMAKE_PREFIX_PATH "/opt/homebrew/opt/opencv")
 endif()
 
+if(APPLE AND EXISTS "/opt/homebrew/anaconda3/lib/cmake/Boost-1.82.0")
+  set(Boost_DIR "/opt/homebrew/anaconda3/lib/cmake/Boost-1.82.0")
+endif()
+
+if(EXISTS "${CMAKE_SOURCE_DIR}/.deps/gtsam-install")
+  list(PREPEND CMAKE_PREFIX_PATH "${CMAKE_SOURCE_DIR}/.deps/gtsam-install")
+endif()
+
 find_package(OpenCV REQUIRED COMPONENTS calib3d core features2d imgproc videoio)
+find_package(GTSAM CONFIG REQUIRED)
 find_program(XCRUN_EXECUTABLE xcrun REQUIRED)
 
 set(SHADER_SOURCE "${CMAKE_SOURCE_DIR}/shaders/luma.metal")
@@ -44,6 +57,7 @@ add_executable(macos-metal-vslam
 target_include_directories(macos-metal-vslam PRIVATE include)
 target_link_libraries(macos-metal-vslam PRIVATE
   ${OpenCV_LIBS}
+  gtsam
   "-framework AppKit"
   "-framework Foundation"
   "-framework Metal"
@@ -59,6 +73,10 @@ set_source_files_properties(
   src/AppMain.mm
   src/MetalLumaProcessor.mm
   PROPERTIES COMPILE_FLAGS "-fobjc-arc"
+)
+
+set_target_properties(macos-metal-vslam PROPERTIES
+  BUILD_RPATH "${CMAKE_SOURCE_DIR}/.deps/gtsam-install/lib;/opt/homebrew/anaconda3/lib"
 )
 
 add_dependencies(macos-metal-vslam vslam_shaders)

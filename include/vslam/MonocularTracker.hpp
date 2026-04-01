@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -42,20 +43,37 @@ struct TrackingFrame {
 class MonocularTracker {
  public:
   explicit MonocularTracker(bool prefer_metal = true);
+  ~MonocularTracker();
 
   TrackingFrame process(const cv::Mat& frame_bgr);
   bool usingMetal() const;
 
  private:
+  struct FactorGraphState;
+
   struct Keyframe {
     int frame_index = 0;
-    cv::Matx44d T_w_c = cv::Matx44d::eye();
+    int graph_index = -1;
+    cv::Matx44d T_w_c_initial = cv::Matx44d::eye();
+    cv::Matx44d T_w_c_optimized = cv::Matx44d::eye();
     cv::Mat image_bgr;
     std::vector<cv::KeyPoint> keypoints;
     cv::Mat descriptors;
   };
 
+  struct AnchoredColoredPoint {
+    int keyframe_index = -1;
+    cv::Point3d position_in_keyframe;
+    cv::Vec3b bgr = cv::Vec3b(255, 255, 255);
+  };
+
   void initializeIntrinsics(const cv::Size& frame_size);
+  void seedKeyframe(const cv::Mat& frame_bgr, const std::vector<cv::KeyPoint>& keypoints,
+                    const cv::Mat& descriptors, const cv::Matx44d& T_w_c);
+  void addKeyframe(const cv::Mat& frame_bgr, const std::vector<cv::KeyPoint>& keypoints,
+                   const cv::Mat& descriptors, const cv::Matx44d& T_w_c);
+  void optimizePoseGraph();
+  void rebuildWorldGeometry();
 
   bool prefer_metal_ = true;
   bool intrinsics_initialized_ = false;
@@ -69,9 +87,11 @@ class MonocularTracker {
   cv::Mat prev_gray_;
   std::vector<cv::KeyPoint> prev_keypoints_;
   cv::Mat prev_descriptors_;
-  bool has_active_keyframe_ = false;
-  Keyframe active_keyframe_;
+  int active_keyframe_index_ = -1;
+  std::vector<Keyframe> keyframes_;
+  std::unique_ptr<FactorGraphState> factor_graph_;
   std::vector<cv::Point3d> trajectory_history_;
+  std::vector<AnchoredColoredPoint> map_points_local_;
   std::vector<ColoredPoint> map_points_world_;
 };
 

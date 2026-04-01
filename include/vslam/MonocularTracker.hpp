@@ -17,6 +17,7 @@ struct TrackingStats {
   bool pose_updated = false;
   bool metal_enabled = false;
   int keypoints = 0;
+  int keyframes = 0;
   int matches = 0;
   int inliers = 0;
   int map_points = 0;
@@ -41,10 +42,18 @@ class MonocularTracker {
   bool usingMetal() const;
 
  private:
+  struct Keyframe {
+    int frame_index = 0;
+    cv::Matx44d T_w_c = cv::Matx44d::eye();
+    std::vector<cv::KeyPoint> keypoints;
+    cv::Mat descriptors;
+  };
+
   void initializeIntrinsics(const cv::Size& frame_size);
 
   bool prefer_metal_ = true;
   bool intrinsics_initialized_ = false;
+  int frame_index_ = 0;
   cv::Size frame_size_;
   cv::Matx33d camera_matrix_ = cv::Matx33d::eye();
   cv::Matx44d T_c_w_ = cv::Matx44d::eye();
@@ -54,6 +63,8 @@ class MonocularTracker {
   cv::Mat prev_gray_;
   std::vector<cv::KeyPoint> prev_keypoints_;
   cv::Mat prev_descriptors_;
+  bool has_active_keyframe_ = false;
+  Keyframe active_keyframe_;
   std::vector<cv::Point3d> trajectory_history_;
   std::vector<cv::Point3d> map_points_world_;
 };

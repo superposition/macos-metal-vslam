@@ -30,6 +30,7 @@ That keeps the repo native to Apple Silicon without locking the SLAM logic into 
 - SceneKit viewport for sparse world points and camera trajectory
 - ORB feature extraction and matching
 - monocular relative pose estimation with OpenCV
+- lightweight keyframe-based triangulation for richer sparse reconstruction
 - sparse triangulation count for map bootstrap feedback
 - Metal-accelerated BGR-to-luma preprocessing with CPU fallback
 - CMake build for Apple Silicon
@@ -66,6 +67,7 @@ The first launch may prompt for camera access.
 
 - Pose scale is arbitrary because this is monocular tracking.
 - Camera intrinsics are approximated from image size. For serious tracking, replace that with real calibration.
+- The tracker estimates pose on every frame, but only promotes occasional high-parallax frames to keyframes for reconstruction so the webcam UI stays responsive.
 - The Metal path currently accelerates image preprocessing. The backend remains CPU/OpenCV to keep the starter understandable.
 
 ## Roadmap

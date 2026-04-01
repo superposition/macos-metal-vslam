@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <numeric>
 #include <sstream>
 #include <vector>
 
@@ -39,6 +40,69 @@ std::vector<cv::DMatch> RatioTestMatches(const cv::BFMatcher& matcher,
     }
   }
   return filtered_matches;
+}
+
+void GatherMatchedPoints(const std::vector<cv::KeyPoint>& source_keypoints,
+                         const std::vector<cv::KeyPoint>& target_keypoints,
+                         const std::vector<cv::DMatch>& matches,
+                         std::vector<cv::Point2f>& source_points,
+                         std::vector<cv::Point2f>& target_points) {
+  source_points.clear();
+  target_points.clear();
+  source_points.reserve(matches.size());
+  target_points.reserve(matches.size());
+  for (const auto& match : matches) {
+    source_points.push_back(source_keypoints[match.queryIdx].pt);
+    target_points.push_back(target_keypoints[match.trainIdx].pt);
+  }
+}
+
+double MedianPixelMotion(const std::vector<cv::Point2f>& previous_points,
+                         const std::vector<cv::Point2f>& current_points) {
+  if (previous_points.size() != current_points.size() || previous_points.empty()) {
+    return 0.0;
+  }
+
+  std::vector<double> motions;
+  motions.reserve(previous_points.size());
+  for (size_t i = 0; i < previous_points.size(); ++i) {
+    motions.push_back(cv::norm(current_points[i] - previous_points[i]));
+  }
+  const size_t midpoint = motions.size() / 2;
+  std::nth_element(motions.begin(), motions.begin() + midpoint, motions.end());
+  return motions[midpoint];
+}
+
+cv::Matx44d RelativePose(const cv::Matx44d& from_pose, const cv::Matx44d& to_pose) {
+  return to_pose.inv() * from_pose;
+}
+
+cv::Matx33d RotationFromPose(const cv::Matx44d& pose) {
+  cv::Matx33d rotation = cv::Matx33d::eye();
+  for (int row = 0; row < 3; ++row) {
+    for (int col = 0; col < 3; ++col) {
+      rotation(row, col) = pose(row, col);
+    }
+  }
+  return rotation;
+}
+
+cv::Vec3d TranslationFromPose(const cv::Matx44d& pose) {
+  return cv::Vec3d(pose(0, 3), pose(1, 3), pose(2, 3));
+}
+
+bool ShouldCreateKeyframe(int frames_since_keyframe, double baseline, double median_pixel_motion,
+                          int inliers) {
+  if (inliers < 40) {
+    return false;
+  }
+  if (frames_since_keyframe >= 18) {
+    return true;
+  }
+  if (frames_since_keyframe < 6) {
+    return false;
+  }
+  return baseline > 0.35 || median_pixel_motion > 36.0;
 }
 
 cv::Mat RenderGeometryView(const std::vector<cv::Point3d>& points,
@@ -123,7 +187,7 @@ void DrawTrackedPoints(cv::Mat& image,
 }
 
 std::vector<cv::Point3d> TriangulatePositiveDepthPoints(
-    const cv::Matx33d& camera_matrix, const cv::Mat& rotation, const cv::Mat& translation,
+    const cv::Matx33d& camera_matrix, const cv::Matx33d& rotation, const cv::Vec3d& translation,
     const std::vector<cv::Point2f>& previous_points,
     const std::vector<cv::Point2f>& current_points) {
   if (previous_points.size() < 8 || current_points.size() < 8) {
@@ -138,9 +202,9 @@ std::vector<cv::Point3d> TriangulatePositiveDepthPoints(
                               0.0, 0.0, 0.0, 0.0);
   for (int row = 0; row < 3; ++row) {
     for (int col = 0; col < 3; ++col) {
-      projection_curr(row, col) = rotation.at<double>(row, col);
+      projection_curr(row, col) = rotation(row, col);
     }
-    projection_curr(row, 3) = translation.at<double>(row, 0);
+    projection_curr(row, 3) = translation[row];
   }
 
   cv::Mat homogeneous_points;
@@ -148,7 +212,7 @@ std::vector<cv::Point3d> TriangulatePositiveDepthPoints(
                         previous_points, current_points, homogeneous_points);
 
   std::vector<cv::Point3d> positive_depth_points;
-  positive_depth_points.reserve(std::min(homogeneous_points.cols, 256));
+  positive_depth_points.reserve(std::min(homogeneous_points.cols, 1200));
   for (int col = 0; col < homogeneous_points.cols; ++col) {
     const double w = homogeneous_points.at<double>(3, col);
     if (std::abs(w) < 1e-9) {
@@ -161,15 +225,24 @@ std::vector<cv::Point3d> TriangulatePositiveDepthPoints(
       continue;
     }
 
-    const cv::Vec3d point_current =
-        cv::Matx33d(rotation) * cv::Vec3d(x, y, z) +
-        cv::Vec3d(translation.at<double>(0, 0), translation.at<double>(1, 0),
-                  translation.at<double>(2, 0));
+    const cv::Vec3d point_previous(x, y, z);
+    const cv::Vec3d point_current = rotation * point_previous + translation;
     if (point_current[2] > 0.0) {
-      positive_depth_points.emplace_back(x, y, z);
-      if (positive_depth_points.size() >= 256) {
-        break;
+      const cv::Vec3d projection_prev_vec = camera_matrix * point_previous;
+      const cv::Vec3d projection_curr_vec = camera_matrix * point_current;
+      if (projection_prev_vec[2] <= 1e-9 || projection_curr_vec[2] <= 1e-9) {
+        continue;
       }
+      const cv::Point2f reproj_prev(static_cast<float>(projection_prev_vec[0] / projection_prev_vec[2]),
+                                    static_cast<float>(projection_prev_vec[1] / projection_prev_vec[2]));
+      const cv::Point2f reproj_curr(static_cast<float>(projection_curr_vec[0] / projection_curr_vec[2]),
+                                    static_cast<float>(projection_curr_vec[1] / projection_curr_vec[2]));
+      const double reproj_error =
+          0.5 * (cv::norm(reproj_prev - previous_points[col]) + cv::norm(reproj_curr - current_points[col]));
+      if (reproj_error > 2.5) {
+        continue;
+      }
+      positive_depth_points.emplace_back(x, y, z);
     }
   }
   return positive_depth_points;
@@ -192,7 +265,8 @@ std::string PoseSummary(const TrackingStats& stats) {
   stream.setf(std::ios::fixed);
   stream.precision(3);
   stream << stats.status << " | metal: " << (stats.metal_enabled ? "on" : "off")
-         << " | kp: " << stats.keypoints << " | matches: " << stats.matches
+         << " | kp: " << stats.keypoints << " | kf: " << stats.keyframes
+         << " | matches: " << stats.matches
          << " | inliers: " << stats.inliers << " | map: " << stats.map_points
          << " | travel: " << stats.translation_norm;
   return stream.str();
@@ -202,7 +276,7 @@ std::string PoseSummary(const TrackingStats& stats) {
 
 MonocularTracker::MonocularTracker(bool prefer_metal)
     : prefer_metal_(prefer_metal),
-      orb_(cv::ORB::create(1600)),
+      orb_(cv::ORB::create(2800)),
       matcher_(cv::NORM_HAMMING, false) {}
 
 bool MonocularTracker::usingMetal() const {
@@ -220,12 +294,15 @@ void MonocularTracker::initializeIntrinsics(const cv::Size& frame_size) {
   prev_gray_.release();
   prev_keypoints_.clear();
   prev_descriptors_.release();
+  has_active_keyframe_ = false;
   map_points_world_.clear();
   trajectory_history_.clear();
   trajectory_history_.emplace_back(0.0, 0.0, 0.0);
+  frame_index_ = 0;
 }
 
 TrackingFrame MonocularTracker::process(const cv::Mat& frame_bgr) {
+  ++frame_index_;
   TrackingFrame result;
   if (frame_bgr.empty()) {
     result.stats.status = "No frame available.";
@@ -256,6 +333,7 @@ TrackingFrame MonocularTracker::process(const cv::Mat& frame_bgr) {
   result.stats.initialized = !prev_descriptors_.empty();
   result.stats.metal_enabled = metal_used;
   result.stats.keypoints = static_cast<int>(keypoints.size());
+  result.stats.keyframes = has_active_keyframe_ ? 1 : 0;
   result.stats.status = "Bootstrapping";
   result.stats.pose_matrix = T_c_w_.inv();
 
@@ -271,6 +349,15 @@ TrackingFrame MonocularTracker::process(const cv::Mat& frame_bgr) {
     prev_gray_ = gray;
     prev_keypoints_ = keypoints;
     prev_descriptors_ = descriptors.clone();
+    if (!has_active_keyframe_ && !descriptors.empty() && keypoints.size() >= 80) {
+      active_keyframe_.frame_index = frame_index_;
+      active_keyframe_.T_w_c = T_c_w_.inv();
+      active_keyframe_.keypoints = keypoints;
+      active_keyframe_.descriptors = descriptors.clone();
+      has_active_keyframe_ = true;
+      result.stats.keyframes = 1;
+      result.stats.status = "Seeded keyframe";
+    }
     cv::putText(result.display_bgr, PoseSummary(result.stats), cv::Point(20, 32),
                 cv::FONT_HERSHEY_DUPLEX, 0.7, cv::Scalar(30, 255, 30), 2, cv::LINE_AA);
     return result;
@@ -291,12 +378,7 @@ TrackingFrame MonocularTracker::process(const cv::Mat& frame_bgr) {
 
   std::vector<cv::Point2f> previous_points;
   current_points.clear();
-  previous_points.reserve(matches.size());
-  current_points.reserve(matches.size());
-  for (const auto& match : matches) {
-    previous_points.push_back(prev_keypoints_[match.queryIdx].pt);
-    current_points.push_back(keypoints[match.trainIdx].pt);
-  }
+  GatherMatchedPoints(prev_keypoints_, keypoints, matches, previous_points, current_points);
 
   cv::Mat inlier_mask;
   const cv::Mat essential =
@@ -338,34 +420,70 @@ TrackingFrame MonocularTracker::process(const cv::Mat& frame_bgr) {
     previous_inliers.push_back(previous_points[index]);
     current_inliers.push_back(current_points[index]);
   }
-
-  const std::vector<cv::Point3d> positive_depth_points = TriangulatePositiveDepthPoints(
-      camera_matrix_, rotation, translation, previous_inliers, current_inliers);
-  result.stats.map_points = static_cast<int>(positive_depth_points.size());
-  result.stats.pose_updated = true;
-  result.stats.status = "Tracking";
-
-  const cv::Matx44d T_c_w_prev = T_c_w_;
-  const cv::Matx44d T_w_c_prev = T_c_w_prev.inv();
   const cv::Matx44d delta_pose = ComposePose(rotation, translation);
   T_c_w_ = delta_pose * T_c_w_;
   const cv::Matx44d T_w_c = T_c_w_.inv();
   result.stats.pose_matrix = T_w_c;
   result.stats.translation_norm =
       cv::norm(cv::Vec3d(T_w_c(0, 3), T_w_c(1, 3), T_w_c(2, 3)));
+  result.stats.pose_updated = true;
+  result.stats.status = "Tracking";
   trajectory_history_.emplace_back(T_w_c(0, 3), T_w_c(1, 3), T_w_c(2, 3));
   if (trajectory_history_.size() > 512) {
     trajectory_history_.erase(trajectory_history_.begin(),
                               trajectory_history_.begin() + (trajectory_history_.size() - 512));
   }
-  const std::vector<cv::Point3d> world_points = TransformPointsToWorld(positive_depth_points, T_w_c_prev);
-  for (size_t index = 0; index < world_points.size(); index += 3) {
-    map_points_world_.push_back(world_points[index]);
+
+  std::vector<cv::Point3d> triangulated_world_points;
+  if (has_active_keyframe_ && !active_keyframe_.descriptors.empty()) {
+    const std::vector<cv::DMatch> keyframe_matches =
+        RatioTestMatches(matcher_, active_keyframe_.descriptors, descriptors);
+    std::vector<cv::Point2f> keyframe_points;
+    std::vector<cv::Point2f> current_keyframe_points;
+    GatherMatchedPoints(active_keyframe_.keypoints, keypoints, keyframe_matches,
+                        keyframe_points, current_keyframe_points);
+
+    const cv::Matx44d T_c_k = RelativePose(active_keyframe_.T_w_c, T_w_c);
+    const cv::Vec3d keyframe_translation = TranslationFromPose(T_c_k);
+    const double keyframe_baseline = cv::norm(keyframe_translation);
+    const double keyframe_motion = MedianPixelMotion(keyframe_points, current_keyframe_points);
+
+    if (keyframe_matches.size() >= 32 && keyframe_baseline > 0.12 && keyframe_motion > 14.0) {
+      const std::vector<cv::Point3d> keyframe_points_3d = TriangulatePositiveDepthPoints(
+          camera_matrix_, RotationFromPose(T_c_k), keyframe_translation, keyframe_points,
+          current_keyframe_points);
+      triangulated_world_points =
+          TransformPointsToWorld(keyframe_points_3d, active_keyframe_.T_w_c);
+      result.stats.map_points = static_cast<int>(triangulated_world_points.size());
+    }
+
+    const int frames_since_keyframe = frame_index_ - active_keyframe_.frame_index;
+    if (ShouldCreateKeyframe(frames_since_keyframe, keyframe_baseline, keyframe_motion, inlier_count)) {
+      active_keyframe_.frame_index = frame_index_;
+      active_keyframe_.T_w_c = T_w_c;
+      active_keyframe_.keypoints = keypoints;
+      active_keyframe_.descriptors = descriptors.clone();
+      result.stats.status = "Tracking + keyframe";
+    }
+  } else {
+    active_keyframe_.frame_index = frame_index_;
+    active_keyframe_.T_w_c = T_w_c;
+    active_keyframe_.keypoints = keypoints;
+    active_keyframe_.descriptors = descriptors.clone();
+    has_active_keyframe_ = true;
+    result.stats.status = "Tracking + seeded keyframe";
   }
-  if (map_points_world_.size() > 1500) {
+
+  if (!triangulated_world_points.empty()) {
+    for (const auto& point : triangulated_world_points) {
+      map_points_world_.push_back(point);
+    }
+  }
+  if (map_points_world_.size() > 6000) {
     map_points_world_.erase(map_points_world_.begin(),
-                            map_points_world_.begin() + (map_points_world_.size() - 1500));
+                            map_points_world_.begin() + (map_points_world_.size() - 6000));
   }
+  result.stats.keyframes = has_active_keyframe_ ? 1 : 0;
   result.geometry_bgr = RenderGeometryView(map_points_world_, trajectory_history_);
   result.world_points = map_points_world_;
   result.trajectory_points = trajectory_history_;

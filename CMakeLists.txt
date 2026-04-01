@@ -24,7 +24,7 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/.deps/gtsam-install")
   list(PREPEND CMAKE_PREFIX_PATH "${CMAKE_SOURCE_DIR}/.deps/gtsam-install")
 endif()
 
-find_package(OpenCV REQUIRED COMPONENTS calib3d core features2d imgproc videoio)
+find_package(OpenCV REQUIRED COMPONENTS calib3d core features2d imgproc video videoio)
 find_package(GTSAM CONFIG REQUIRED)
 find_program(XCRUN_EXECUTABLE xcrun REQUIRED)
 

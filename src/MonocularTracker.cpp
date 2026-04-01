@@ -15,6 +15,7 @@
 #include <gtsam/slam/BetweenFactor.h>
 #include <gtsam/slam/PriorFactor.h>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/video/tracking.hpp>
 
 namespace vslam {
 
@@ -132,6 +133,81 @@ cv::Matx33d RotationFromPose(const cv::Matx44d& pose) {
 
 cv::Vec3d TranslationFromPose(const cv::Matx44d& pose) {
   return cv::Vec3d(pose(0, 3), pose(1, 3), pose(2, 3));
+}
+
+cv::Mat EnhanceGrayFrame(const cv::Mat& gray) {
+  static cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(2.5, cv::Size(8, 8));
+  cv::Mat enhanced;
+  clahe->apply(gray, enhanced);
+  return enhanced;
+}
+
+void RefineMatchesWithOpticalFlow(const cv::Mat& previous_gray,
+                                  const cv::Mat& current_gray,
+                                  const std::vector<cv::Point2f>& descriptor_previous_points,
+                                  const std::vector<cv::Point2f>& descriptor_current_points,
+                                  std::vector<cv::Point2f>& refined_previous_points,
+                                  std::vector<cv::Point2f>& refined_current_points) {
+  refined_previous_points.clear();
+  refined_current_points.clear();
+  if (descriptor_previous_points.size() != descriptor_current_points.size() ||
+      descriptor_previous_points.empty()) {
+    return;
+  }
+
+  std::vector<cv::Point2f> tracked_current_points = descriptor_current_points;
+  std::vector<uchar> forward_status;
+  std::vector<float> forward_error;
+  const cv::TermCriteria criteria(cv::TermCriteria::COUNT | cv::TermCriteria::EPS, 30, 0.01);
+  cv::calcOpticalFlowPyrLK(previous_gray, current_gray, descriptor_previous_points,
+                           tracked_current_points, forward_status, forward_error,
+                           cv::Size(21, 21), 3, criteria, cv::OPTFLOW_USE_INITIAL_FLOW, 1e-4);
+
+  std::vector<cv::Point2f> tracked_back_points = descriptor_previous_points;
+  std::vector<uchar> backward_status;
+  std::vector<float> backward_error;
+  cv::calcOpticalFlowPyrLK(current_gray, previous_gray, tracked_current_points,
+                           tracked_back_points, backward_status, backward_error,
+                           cv::Size(21, 21), 3, criteria, 0, 1e-4);
+
+  refined_previous_points.reserve(descriptor_previous_points.size());
+  refined_current_points.reserve(descriptor_previous_points.size());
+  for (size_t i = 0; i < descriptor_previous_points.size(); ++i) {
+    if (forward_status[i] == 0 || backward_status[i] == 0) {
+      continue;
+    }
+    if (forward_error[i] > 20.0f || backward_error[i] > 20.0f) {
+      continue;
+    }
+    const double forward_agreement =
+        cv::norm(tracked_current_points[i] - descriptor_current_points[i]);
+    const double round_trip_error =
+        cv::norm(tracked_back_points[i] - descriptor_previous_points[i]);
+    if (forward_agreement > 12.0 || round_trip_error > 1.5) {
+      continue;
+    }
+    refined_previous_points.push_back(descriptor_previous_points[i]);
+    refined_current_points.push_back(tracked_current_points[i]);
+  }
+}
+
+double RotationAngleDegrees(const cv::Mat& rotation) {
+  cv::Mat rotation_vector;
+  cv::Rodrigues(rotation, rotation_vector);
+  return cv::norm(rotation_vector) * (180.0 / CV_PI);
+}
+
+double EstimateTranslationScale(const cv::Size& frame_size, double median_pixel_motion,
+                                double inlier_ratio) {
+  const double max_dimension =
+      static_cast<double>(std::max(frame_size.width, frame_size.height));
+  if (max_dimension <= 0.0 || median_pixel_motion < 1.5) {
+    return 0.0;
+  }
+
+  const double normalized_motion = median_pixel_motion / max_dimension;
+  const double raw_scale = 6.0 * normalized_motion * std::clamp(inlier_ratio, 0.25, 1.0);
+  return std::clamp(raw_scale, 0.004, 0.10);
 }
 
 bool ShouldCreateKeyframe(int frames_since_keyframe, double baseline, double median_pixel_motion,
@@ -360,7 +436,7 @@ struct MonocularTracker::FactorGraphState {
 
 MonocularTracker::MonocularTracker(bool prefer_metal)
     : prefer_metal_(prefer_metal),
-      orb_(cv::ORB::create(4200)),
+      orb_(cv::ORB::create(4200, 1.2f, 8, 31, 0, 2, cv::ORB::HARRIS_SCORE, 31, 12)),
       matcher_(cv::NORM_HAMMING, false),
       factor_graph_(std::make_unique<FactorGraphState>()) {}
 
@@ -522,6 +598,7 @@ TrackingFrame MonocularTracker::process(const cv::Mat& frame_bgr) {
   } else {
     cv::cvtColor(frame_bgr, gray, cv::COLOR_BGR2GRAY);
   }
+  gray = EnhanceGrayFrame(gray);
 
   std::vector<cv::KeyPoint> keypoints;
   cv::Mat descriptors;
@@ -581,13 +658,38 @@ TrackingFrame MonocularTracker::process(const cv::Mat& frame_bgr) {
   }
 
   std::vector<cv::Point2f> previous_points;
-  current_points.clear();
-  GatherMatchedPoints(prev_keypoints_, keypoints, matches, previous_points, current_points);
+  std::vector<cv::Point2f> descriptor_current_points;
+  GatherMatchedPoints(prev_keypoints_, keypoints, matches, previous_points, descriptor_current_points);
+
+  std::vector<cv::Point2f> refined_previous_points;
+  std::vector<cv::Point2f> refined_current_points;
+  RefineMatchesWithOpticalFlow(prev_gray_, gray, previous_points, descriptor_current_points,
+                               refined_previous_points, refined_current_points);
+  if (refined_previous_points.size() >= 24) {
+    previous_points = std::move(refined_previous_points);
+    current_points = std::move(refined_current_points);
+  } else {
+    current_points = std::move(descriptor_current_points);
+  }
+  result.stats.matches = static_cast<int>(previous_points.size());
+
+  const double matched_motion = MedianPixelMotion(previous_points, current_points);
+  if (matched_motion < 1.25) {
+    result.stats.status = "Hold pose: low motion";
+    prev_frame_bgr_ = frame_bgr.clone();
+    prev_gray_ = gray;
+    prev_keypoints_ = keypoints;
+    prev_descriptors_ = descriptors.clone();
+    cv::putText(result.display_bgr, PoseSummary(result.stats), cv::Point(20, 32),
+                cv::FONT_HERSHEY_DUPLEX, 0.7, cv::Scalar(30, 255, 30), 2, cv::LINE_AA);
+    return result;
+  }
 
   cv::Mat inlier_mask;
+  const double essential_threshold = std::clamp(0.55 + 0.02 * matched_motion, 0.55, 1.35);
   const cv::Mat essential =
       cv::findEssentialMat(previous_points, current_points, camera_matrix_, cv::RANSAC,
-                           0.999, 1.0, inlier_mask);
+                           0.999, essential_threshold, inlier_mask);
   if (essential.empty()) {
     result.stats.status = "Essential matrix failed";
     prev_frame_bgr_ = frame_bgr.clone();
@@ -604,8 +706,21 @@ TrackingFrame MonocularTracker::process(const cv::Mat& frame_bgr) {
   const int inlier_count = cv::recoverPose(essential, previous_points, current_points,
                                            camera_matrix_, rotation, translation, inlier_mask);
   result.stats.inliers = inlier_count;
-  if (inlier_count < 16) {
+  const double inlier_ratio =
+      previous_points.empty() ? 0.0 : static_cast<double>(inlier_count) / previous_points.size();
+  const double rotation_angle_deg = RotationAngleDegrees(rotation);
+  if (inlier_count < 24 || inlier_ratio < 0.45) {
     result.stats.status = "Pose recovery unstable";
+    prev_frame_bgr_ = frame_bgr.clone();
+    prev_gray_ = gray;
+    prev_keypoints_ = keypoints;
+    prev_descriptors_ = descriptors.clone();
+    cv::putText(result.display_bgr, PoseSummary(result.stats), cv::Point(20, 32),
+                cv::FONT_HERSHEY_DUPLEX, 0.7, cv::Scalar(30, 255, 30), 2, cv::LINE_AA);
+    return result;
+  }
+  if (rotation_angle_deg > 20.0 && matched_motion < 10.0) {
+    result.stats.status = "Hold pose: noisy rotation";
     prev_frame_bgr_ = frame_bgr.clone();
     prev_gray_ = gray;
     prev_keypoints_ = keypoints;
@@ -626,6 +741,20 @@ TrackingFrame MonocularTracker::process(const cv::Mat& frame_bgr) {
     previous_inliers.push_back(previous_points[index]);
     current_inliers.push_back(current_points[index]);
   }
+  const double inlier_motion = MedianPixelMotion(previous_inliers, current_inliers);
+  const double translation_scale =
+      EstimateTranslationScale(frame_size_, inlier_motion, inlier_ratio);
+  if (translation_scale <= 0.0) {
+    result.stats.status = "Hold pose: weak baseline";
+    prev_frame_bgr_ = frame_bgr.clone();
+    prev_gray_ = gray;
+    prev_keypoints_ = keypoints;
+    prev_descriptors_ = descriptors.clone();
+    cv::putText(result.display_bgr, PoseSummary(result.stats), cv::Point(20, 32),
+                cv::FONT_HERSHEY_DUPLEX, 0.7, cv::Scalar(30, 255, 30), 2, cv::LINE_AA);
+    return result;
+  }
+  translation *= translation_scale;
   const cv::Matx44d previous_T_c_w = T_c_w_;
   const cv::Matx44d previous_T_w_c = previous_T_c_w.inv();
   const cv::Matx44d delta_pose = ComposePose(rotation, translation);

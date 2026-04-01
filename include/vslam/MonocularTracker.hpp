@@ -84,6 +84,7 @@ class MonocularTracker {
   cv::Ptr<cv::ORB> orb_;
   cv::BFMatcher matcher_;
   MetalLumaProcessor metal_;
+  cv::Mat prev_frame_bgr_;
   cv::Mat prev_gray_;
   std::vector<cv::KeyPoint> prev_keypoints_;
   cv::Mat prev_descriptors_;
@@ -92,6 +93,7 @@ class MonocularTracker {
   std::unique_ptr<FactorGraphState> factor_graph_;
   std::vector<cv::Point3d> trajectory_history_;
   std::vector<AnchoredColoredPoint> map_points_local_;
+  std::vector<ColoredPoint> transient_world_points_;
   std::vector<ColoredPoint> map_points_world_;
 };
 

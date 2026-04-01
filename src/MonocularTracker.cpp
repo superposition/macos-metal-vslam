@@ -136,16 +136,16 @@ cv::Vec3d TranslationFromPose(const cv::Matx44d& pose) {
 
 bool ShouldCreateKeyframe(int frames_since_keyframe, double baseline, double median_pixel_motion,
                           int inliers) {
-  if (inliers < 40) {
+  if (inliers < 32) {
     return false;
   }
-  if (frames_since_keyframe >= 18) {
+  if (frames_since_keyframe >= 16) {
     return true;
   }
-  if (frames_since_keyframe < 6) {
+  if (frames_since_keyframe < 5) {
     return false;
   }
-  return baseline > 0.35 || median_pixel_motion > 36.0;
+  return baseline > 0.18 || median_pixel_motion > 18.0;
 }
 
 cv::Mat RenderGeometryView(const std::vector<ColoredPoint>& points,
@@ -257,7 +257,7 @@ std::vector<ColoredPoint> TriangulatePositiveDepthPoints(
                         previous_points, current_points, homogeneous_points);
 
   std::vector<ColoredPoint> positive_depth_points;
-  positive_depth_points.reserve(std::min(homogeneous_points.cols, 1200));
+  positive_depth_points.reserve(std::min(homogeneous_points.cols, 1600));
   for (int col = 0; col < homogeneous_points.cols; ++col) {
     const double w = homogeneous_points.at<double>(3, col);
     if (std::abs(w) < 1e-9) {
@@ -266,7 +266,7 @@ std::vector<ColoredPoint> TriangulatePositiveDepthPoints(
     const double x = homogeneous_points.at<double>(0, col) / w;
     const double y = homogeneous_points.at<double>(1, col) / w;
     const double z = homogeneous_points.at<double>(2, col) / w;
-    if (z <= 0.0) {
+    if (z <= 0.0 || z > 12.0 || !std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {
       continue;
     }
 
@@ -284,13 +284,40 @@ std::vector<ColoredPoint> TriangulatePositiveDepthPoints(
                                     static_cast<float>(projection_curr_vec[1] / projection_curr_vec[2]));
       const double reproj_error =
           0.5 * (cv::norm(reproj_prev - previous_points[col]) + cv::norm(reproj_curr - current_points[col]));
-      if (reproj_error > 2.5) {
+      if (reproj_error > 4.0) {
         continue;
       }
       positive_depth_points.push_back({cv::Point3d(x, y, z), SampleColorAt(source_image_bgr, previous_points[col])});
     }
   }
   return positive_depth_points;
+}
+
+void AppendCappedPoints(const std::vector<ColoredPoint>& source_points,
+                        std::vector<ColoredPoint>& target_points,
+                        size_t per_update_cap,
+                        size_t total_cap) {
+  if (source_points.empty()) {
+    return;
+  }
+
+  const size_t stride = std::max<size_t>(1, source_points.size() / std::max<size_t>(1, per_update_cap));
+  for (size_t index = 0; index < source_points.size(); index += stride) {
+    const auto& point = source_points[index];
+    if (!std::isfinite(point.position.x) || !std::isfinite(point.position.y) ||
+        !std::isfinite(point.position.z)) {
+      continue;
+    }
+    if (cv::norm(point.position) > 40.0) {
+      continue;
+    }
+    target_points.push_back(point);
+  }
+
+  if (target_points.size() > total_cap) {
+    target_points.erase(target_points.begin(),
+                        target_points.begin() + (target_points.size() - total_cap));
+  }
 }
 
 std::string PoseSummary(const TrackingStats& stats) {
@@ -333,7 +360,7 @@ struct MonocularTracker::FactorGraphState {
 
 MonocularTracker::MonocularTracker(bool prefer_metal)
     : prefer_metal_(prefer_metal),
-      orb_(cv::ORB::create(2800)),
+      orb_(cv::ORB::create(4200)),
       matcher_(cv::NORM_HAMMING, false),
       factor_graph_(std::make_unique<FactorGraphState>()) {}
 
@@ -351,12 +378,14 @@ void MonocularTracker::initializeIntrinsics(const cv::Size& frame_size) {
                                0.0, 0.0, 1.0);
   intrinsics_initialized_ = true;
   T_c_w_ = cv::Matx44d::eye();
+  prev_frame_bgr_.release();
   prev_gray_.release();
   prev_keypoints_.clear();
   prev_descriptors_.release();
   active_keyframe_index_ = -1;
   keyframes_.clear();
   map_points_local_.clear();
+  transient_world_points_.clear();
   map_points_world_.clear();
   trajectory_history_.clear();
   trajectory_history_.emplace_back(0.0, 0.0, 0.0);
@@ -459,6 +488,7 @@ void MonocularTracker::rebuildWorldGeometry() {
     trajectory_history_.emplace_back(0.0, 0.0, 0.0);
   }
 
+  map_points_world_ = transient_world_points_;
   map_points_world_.reserve(map_points_local_.size());
   for (const auto& point : map_points_local_) {
     if (point.keyframe_index < 0 || point.keyframe_index >= static_cast<int>(keyframes_.size())) {
@@ -517,6 +547,7 @@ TrackingFrame MonocularTracker::process(const cv::Mat& frame_bgr) {
 
   if (prev_descriptors_.empty() || descriptors.empty() || prev_keypoints_.size() < 40 ||
       keypoints.size() < 40) {
+    prev_frame_bgr_ = frame_bgr.clone();
     prev_gray_ = gray;
     prev_keypoints_ = keypoints;
     prev_descriptors_ = descriptors.clone();
@@ -540,6 +571,7 @@ TrackingFrame MonocularTracker::process(const cv::Mat& frame_bgr) {
   result.stats.matches = static_cast<int>(matches.size());
   if (matches.size() < 24) {
     result.stats.status = "Need more stable matches";
+    prev_frame_bgr_ = frame_bgr.clone();
     prev_gray_ = gray;
     prev_keypoints_ = keypoints;
     prev_descriptors_ = descriptors.clone();
@@ -558,6 +590,7 @@ TrackingFrame MonocularTracker::process(const cv::Mat& frame_bgr) {
                            0.999, 1.0, inlier_mask);
   if (essential.empty()) {
     result.stats.status = "Essential matrix failed";
+    prev_frame_bgr_ = frame_bgr.clone();
     prev_gray_ = gray;
     prev_keypoints_ = keypoints;
     prev_descriptors_ = descriptors.clone();
@@ -573,6 +606,7 @@ TrackingFrame MonocularTracker::process(const cv::Mat& frame_bgr) {
   result.stats.inliers = inlier_count;
   if (inlier_count < 16) {
     result.stats.status = "Pose recovery unstable";
+    prev_frame_bgr_ = frame_bgr.clone();
     prev_gray_ = gray;
     prev_keypoints_ = keypoints;
     prev_descriptors_ = descriptors.clone();
@@ -592,6 +626,8 @@ TrackingFrame MonocularTracker::process(const cv::Mat& frame_bgr) {
     previous_inliers.push_back(previous_points[index]);
     current_inliers.push_back(current_points[index]);
   }
+  const cv::Matx44d previous_T_c_w = T_c_w_;
+  const cv::Matx44d previous_T_w_c = previous_T_c_w.inv();
   const cv::Matx44d delta_pose = ComposePose(rotation, translation);
   T_c_w_ = delta_pose * T_c_w_;
   const cv::Matx44d T_w_c = T_c_w_.inv();
@@ -600,6 +636,22 @@ TrackingFrame MonocularTracker::process(const cv::Mat& frame_bgr) {
       cv::norm(cv::Vec3d(T_w_c(0, 3), T_w_c(1, 3), T_w_c(2, 3)));
   result.stats.pose_updated = true;
   result.stats.status = "Tracking";
+
+  if (!prev_frame_bgr_.empty() && previous_inliers.size() >= 24) {
+    const std::vector<ColoredPoint> triangulated_frame_points = TriangulatePositiveDepthPoints(
+        camera_matrix_, RotationFromPose(delta_pose), TranslationFromPose(delta_pose),
+        prev_frame_bgr_, previous_inliers, current_inliers);
+
+    std::vector<ColoredPoint> frame_world_points;
+    frame_world_points.reserve(triangulated_frame_points.size());
+    for (const auto& point : triangulated_frame_points) {
+      const cv::Vec4d local(point.position.x, point.position.y, point.position.z, 1.0);
+      const cv::Vec4d world = previous_T_w_c * local;
+      frame_world_points.push_back({cv::Point3d(world[0], world[1], world[2]), point.bgr});
+    }
+    AppendCappedPoints(frame_world_points, transient_world_points_, 320, 18000);
+    rebuildWorldGeometry();
+  }
 
   if (active_keyframe_index_ < 0) {
     seedKeyframe(frame_bgr, keypoints, descriptors, T_w_c);
@@ -623,7 +675,7 @@ TrackingFrame MonocularTracker::process(const cv::Mat& frame_bgr) {
     const double keyframe_baseline = cv::norm(keyframe_translation);
     const double keyframe_motion = MedianPixelMotion(keyframe_points, current_keyframe_points);
 
-    if (keyframe_matches.size() >= 32 && keyframe_baseline > 0.12 && keyframe_motion > 14.0) {
+    if (keyframe_matches.size() >= 24 && keyframe_baseline > 0.04 && keyframe_motion > 6.0) {
       triangulated_keyframe_points = TriangulatePositiveDepthPoints(
           camera_matrix_, RotationFromPose(T_c_k), keyframe_translation,
           active_keyframe.image_bgr, keyframe_points, current_keyframe_points);
@@ -632,10 +684,10 @@ TrackingFrame MonocularTracker::process(const cv::Mat& frame_bgr) {
         map_points_local_.push_back(
             {active_keyframe.graph_index, point.position, point.bgr});
       }
-      if (map_points_local_.size() > 12000) {
+      if (map_points_local_.size() > 24000) {
         map_points_local_.erase(
             map_points_local_.begin(),
-            map_points_local_.begin() + (map_points_local_.size() - 12000));
+            map_points_local_.begin() + (map_points_local_.size() - 24000));
       }
       rebuildWorldGeometry();
     }
@@ -662,6 +714,7 @@ TrackingFrame MonocularTracker::process(const cv::Mat& frame_bgr) {
   cv::putText(result.display_bgr, PoseSummary(result.stats), cv::Point(20, 32),
               cv::FONT_HERSHEY_DUPLEX, 0.7, cv::Scalar(30, 255, 30), 2, cv::LINE_AA);
 
+  prev_frame_bgr_ = frame_bgr.clone();
   prev_gray_ = gray;
   prev_keypoints_ = keypoints;
   prev_descriptors_ = descriptors.clone();

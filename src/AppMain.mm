@@ -1,4 +1,5 @@
 #include <memory>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -84,6 +85,85 @@ NSTextField* MakeLabel(NSString* text, NSFont* font) {
   return label;
 }
 
+NSColor* DashboardBackgroundColor() {
+  return [NSColor colorWithRed:0.06 green:0.08 blue:0.10 alpha:1.0];
+}
+
+NSColor* CardBackgroundColor() {
+  return [NSColor colorWithRed:0.10 green:0.13 blue:0.16 alpha:1.0];
+}
+
+NSColor* CardBorderColor() {
+  return [NSColor colorWithRed:0.20 green:0.26 blue:0.30 alpha:1.0];
+}
+
+NSColor* AccentColor() {
+  return [NSColor colorWithRed:0.38 green:0.93 blue:0.62 alpha:1.0];
+}
+
+NSFont* DashboardFont(NSString* name, CGFloat size, NSFont* fallback) {
+  NSFont* font = [NSFont fontWithName:name size:size];
+  if (font != nil) {
+    return font;
+  }
+  return fallback;
+}
+
+NSView* MakeCardView(NSRect frame) {
+  NSView* view = [[NSView alloc] initWithFrame:frame];
+  view.wantsLayer = YES;
+  view.layer.backgroundColor = CardBackgroundColor().CGColor;
+  view.layer.borderColor = CardBorderColor().CGColor;
+  view.layer.borderWidth = 1.0;
+  view.layer.cornerRadius = 18.0;
+  return view;
+}
+
+NSTextField* MakeValueLabel(NSString* text, CGFloat size, NSColor* color) {
+  NSTextField* label = MakeLabel(text, DashboardFont(@"Avenir Next Demi Bold", size,
+                                                     [NSFont systemFontOfSize:size
+                                                                        weight:NSFontWeightSemibold]));
+  label.textColor = color;
+  return label;
+}
+
+NSImageView* MakeImageSurface(NSRect frame) {
+  NSImageView* image_view = [[NSImageView alloc] initWithFrame:frame];
+  image_view.imageScaling = NSImageScaleProportionallyUpOrDown;
+  image_view.imageAlignment = NSImageAlignCenter;
+  image_view.wantsLayer = YES;
+  image_view.layer.backgroundColor = [NSColor colorWithRed:0.08 green:0.09 blue:0.11 alpha:1.0].CGColor;
+  image_view.layer.borderColor = CardBorderColor().CGColor;
+  image_view.layer.borderWidth = 1.0;
+  image_view.layer.cornerRadius = 14.0;
+  image_view.layer.masksToBounds = YES;
+  return image_view;
+}
+
+NSView* MakeMetricCard(NSRect frame, NSString* title, NSTextField* __strong* value_label_out) {
+  NSView* card = MakeCardView(frame);
+
+  NSTextField* title_label = MakeLabel(title,
+                                       DashboardFont(@"Avenir Next Medium", 12.0,
+                                                     [NSFont systemFontOfSize:12.0
+                                                                        weight:NSFontWeightMedium]));
+  title_label.frame = NSMakeRect(16.0, frame.size.height - 30.0, frame.size.width - 32.0, 16.0);
+  title_label.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
+  title_label.textColor = [NSColor colorWithRed:0.60 green:0.67 blue:0.73 alpha:1.0];
+  [card addSubview:title_label];
+
+  NSTextField* value_label = MakeValueLabel(@"--", 24.0, AccentColor());
+  value_label.frame = NSMakeRect(16.0, 16.0, frame.size.width - 32.0, 34.0);
+  value_label.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
+  value_label.lineBreakMode = NSLineBreakByTruncatingTail;
+  [card addSubview:value_label];
+
+  if (value_label_out != nullptr) {
+    *value_label_out = value_label;
+  }
+  return card;
+}
+
 NSTextView* MakeTextView(NSRect frame) {
   NSTextView* text_view = [[NSTextView alloc] initWithFrame:frame];
   text_view.editable = NO;
@@ -159,15 +239,17 @@ SCNGeometry* MakePointCloudGeometry(const std::vector<vslam::ColoredPoint>& poin
                                      primitiveType:SCNGeometryPrimitiveTypePoint
                                     primitiveCount:indices.size()
                                      bytesPerIndex:sizeof(uint32_t)];
-  element.pointSize = 6.0;
-  element.minimumPointScreenSpaceRadius = 4.0;
-  element.maximumPointScreenSpaceRadius = 10.0;
+  element.pointSize = 10.0;
+  element.minimumPointScreenSpaceRadius = 6.0;
+  element.maximumPointScreenSpaceRadius = 16.0;
 
   SCNGeometry* geometry =
       [SCNGeometry geometryWithSources:@[ vertex_source, color_source ] elements:@[ element ]];
   geometry.firstMaterial.lightingModelName = SCNLightingModelConstant;
   geometry.firstMaterial.diffuse.contents = NSColor.whiteColor;
   geometry.firstMaterial.doubleSided = YES;
+  geometry.firstMaterial.readsFromDepthBuffer = NO;
+  geometry.firstMaterial.writesToDepthBuffer = NO;
   return geometry;
 }
 
@@ -207,6 +289,56 @@ SCNGeometry* MakeLineGeometry(const std::vector<cv::Point3d>& trajectory) {
   return geometry;
 }
 
+struct VisualizationBounds {
+  SCNVector3 center = SCNVector3Make(0.0f, 0.0f, 0.0f);
+  float scale = 1.0f;
+};
+
+VisualizationBounds MakeVisualizationBounds(const vslam::TrackingFrame& tracked) {
+  double min_x = std::numeric_limits<double>::infinity();
+  double min_y = std::numeric_limits<double>::infinity();
+  double min_z = std::numeric_limits<double>::infinity();
+  double max_x = -std::numeric_limits<double>::infinity();
+  double max_y = -std::numeric_limits<double>::infinity();
+  double max_z = -std::numeric_limits<double>::infinity();
+  bool has_geometry = false;
+
+  auto extend = [&](double x, double y, double z) {
+    min_x = std::min(min_x, x);
+    min_y = std::min(min_y, y);
+    min_z = std::min(min_z, z);
+    max_x = std::max(max_x, x);
+    max_y = std::max(max_y, y);
+    max_z = std::max(max_z, z);
+    has_geometry = true;
+  };
+
+  for (const auto& point : tracked.world_points) {
+    extend(point.position.x, point.position.y, point.position.z);
+  }
+  for (const auto& point : tracked.trajectory_points) {
+    extend(point.x, point.y, point.z);
+  }
+  const cv::Matx44d& pose = tracked.stats.pose_matrix;
+  extend(pose(0, 3), pose(1, 3), pose(2, 3));
+
+  if (!has_geometry) {
+    return {};
+  }
+
+  const double span_x = std::max(1e-3, max_x - min_x);
+  const double span_y = std::max(1e-3, max_y - min_y);
+  const double span_z = std::max(1e-3, max_z - min_z);
+  const double max_span = std::max(span_x, std::max(span_y, span_z));
+
+  VisualizationBounds bounds;
+  bounds.center = SCNVector3Make(static_cast<float>(0.5 * (min_x + max_x)),
+                                 static_cast<float>(0.5 * (min_y + max_y)),
+                                 static_cast<float>(0.5 * (min_z + max_z)));
+  bounds.scale = static_cast<float>(std::clamp(2.2 / max_span, 0.08, 12.0));
+  return bounds;
+}
+
 }  // namespace
 
 @interface AppController : NSObject <NSApplicationDelegate>
@@ -218,10 +350,20 @@ SCNGeometry* MakeLineGeometry(const std::vector<cv::Point3d>& trajectory) {
   SCNView* scene_view_;
   NSTextField* status_label_;
   NSTextField* subtitle_label_;
+  NSTextField* tracking_value_label_;
+  NSTextField* backend_value_label_;
+  NSTextField* keypoints_value_label_;
+  NSTextField* matches_value_label_;
+  NSTextField* inliers_value_label_;
+  NSTextField* keyframes_value_label_;
+  NSTextField* cloud_value_label_;
+  NSTextField* travel_value_label_;
   NSTextView* transform_text_view_;
+  NSImageView* map_overview_view_;
   NSTimer* timer_;
   std::unique_ptr<cv::VideoCapture> capture_;
   vslam::MonocularTracker tracker_;
+  SCNNode* world_root_node_;
   SCNNode* point_cloud_node_;
   SCNNode* trajectory_node_;
   SCNNode* tracked_camera_node_;
@@ -252,52 +394,160 @@ SCNGeometry* MakeLineGeometry(const std::vector<cv::Point3d>& trajectory) {
   [window_ center];
 
   NSView* content_view = window_.contentView;
+  content_view.wantsLayer = YES;
+  content_view.layer.backgroundColor = DashboardBackgroundColor().CGColor;
 
-  NSTextField* title_label = MakeLabel(@"Hello vSLAM", [NSFont boldSystemFontOfSize:30.0]);
-  title_label.frame = NSMakeRect(24.0, 844.0, 400.0, 36.0);
+  NSTextField* title_label = MakeLabel(@"MacBook Webcam vSLAM",
+                                       DashboardFont(@"Avenir Next Bold", 32.0,
+                                                     [NSFont boldSystemFontOfSize:32.0]));
+  title_label.frame = NSMakeRect(24.0, 854.0, 500.0, 36.0);
   title_label.autoresizingMask = NSViewMaxXMargin | NSViewMinYMargin;
+  title_label.textColor = [NSColor colorWithRed:0.96 green:0.97 blue:0.98 alpha:1.0];
   [content_view addSubview:title_label];
 
-  subtitle_label_ = MakeLabel(@"Native AppKit shell, C++ tracking core, Metal preprocessing",
+  subtitle_label_ = MakeLabel(@"Native AppKit dashboard, C++ tracking core, Metal preprocessing, GTSAM iSAM2 pose graph",
                               [NSFont systemFontOfSize:14.0 weight:NSFontWeightMedium]);
-  subtitle_label_.frame = NSMakeRect(24.0, 816.0, 700.0, 24.0);
+  subtitle_label_.frame = NSMakeRect(24.0, 826.0, 1000.0, 24.0);
   subtitle_label_.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
-  subtitle_label_.textColor = [NSColor secondaryLabelColor];
+  subtitle_label_.textColor = [NSColor colorWithRed:0.62 green:0.69 blue:0.75 alpha:1.0];
   [content_view addSubview:subtitle_label_];
 
-  NSBox* camera_box = [[NSBox alloc] initWithFrame:NSMakeRect(24.0, 320.0, 560.0, 470.0)];
-  camera_box.title = @"Camera";
-  camera_box.autoresizingMask = NSViewMaxXMargin | NSViewHeightSizable;
-  [content_view addSubview:camera_box];
+  const CGFloat metric_y = 734.0;
+  const CGFloat metric_width = 165.0;
+  const CGFloat metric_height = 78.0;
+  const CGFloat metric_gap = 10.0;
+  const CGFloat metric_x0 = 24.0;
 
-  image_view_ = [[NSImageView alloc] initWithFrame:NSMakeRect(18.0, 18.0, 524.0, 420.0)];
-  image_view_.imageScaling = NSImageScaleProportionallyUpOrDown;
-  image_view_.imageAlignment = NSImageAlignCenter;
-  image_view_.wantsLayer = YES;
-  image_view_.layer.backgroundColor = NSColor.windowBackgroundColor.CGColor;
+  NSArray<NSView*>* metric_cards = @[
+    MakeMetricCard(NSMakeRect(metric_x0 + (metric_width + metric_gap) * 0, metric_y,
+                              metric_width, metric_height),
+                   @"Tracking", &tracking_value_label_),
+    MakeMetricCard(NSMakeRect(metric_x0 + (metric_width + metric_gap) * 1, metric_y,
+                              metric_width, metric_height),
+                   @"Backend", &backend_value_label_),
+    MakeMetricCard(NSMakeRect(metric_x0 + (metric_width + metric_gap) * 2, metric_y,
+                              metric_width, metric_height),
+                   @"Keypoints", &keypoints_value_label_),
+    MakeMetricCard(NSMakeRect(metric_x0 + (metric_width + metric_gap) * 3, metric_y,
+                              metric_width, metric_height),
+                   @"Matches", &matches_value_label_),
+    MakeMetricCard(NSMakeRect(metric_x0 + (metric_width + metric_gap) * 4, metric_y,
+                              metric_width, metric_height),
+                   @"Inliers", &inliers_value_label_),
+    MakeMetricCard(NSMakeRect(metric_x0 + (metric_width + metric_gap) * 5, metric_y,
+                              metric_width, metric_height),
+                   @"Keyframes", &keyframes_value_label_),
+    MakeMetricCard(NSMakeRect(metric_x0 + (metric_width + metric_gap) * 6, metric_y,
+                              metric_width, metric_height),
+                   @"Cloud", &cloud_value_label_),
+    MakeMetricCard(NSMakeRect(metric_x0 + (metric_width + metric_gap) * 7, metric_y,
+                              metric_width, metric_height),
+                   @"Travel", &travel_value_label_)
+  ];
+  for (NSView* card in metric_cards) {
+    card.autoresizingMask = NSViewMaxXMargin | NSViewMinYMargin;
+    [content_view addSubview:card];
+  }
+
+  NSView* camera_card = MakeCardView(NSMakeRect(24.0, 244.0, 560.0, 470.0));
+  camera_card.autoresizingMask = NSViewMaxXMargin | NSViewHeightSizable;
+  [content_view addSubview:camera_card];
+
+  NSTextField* camera_title = MakeValueLabel(@"Camera Feed", 20.0,
+                                             [NSColor colorWithRed:0.94 green:0.95 blue:0.98 alpha:1.0]);
+  camera_title.frame = NSMakeRect(20.0, 428.0, 240.0, 28.0);
+  camera_title.autoresizingMask = NSViewMaxXMargin | NSViewMinYMargin;
+  [camera_card addSubview:camera_title];
+
+  NSTextField* camera_caption = MakeLabel(@"Live webcam input with tracked feature overlays",
+                                          DashboardFont(@"Avenir Next Medium", 13.0,
+                                                        [NSFont systemFontOfSize:13.0
+                                                                           weight:NSFontWeightMedium]));
+  camera_caption.frame = NSMakeRect(20.0, 404.0, 360.0, 18.0);
+  camera_caption.textColor = [NSColor colorWithRed:0.60 green:0.67 blue:0.73 alpha:1.0];
+  camera_caption.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
+  [camera_card addSubview:camera_caption];
+
+  image_view_ = MakeImageSurface(NSMakeRect(20.0, 20.0, 520.0, 372.0));
   image_view_.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-  [camera_box.contentView addSubview:image_view_];
+  [camera_card addSubview:image_view_];
 
-  NSBox* transform_box = [[NSBox alloc] initWithFrame:NSMakeRect(606.0, 560.0, 790.0, 230.0)];
-  transform_box.title = @"Transforms";
-  transform_box.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
-  [content_view addSubview:transform_box];
+  NSView* geometry_card = MakeCardView(NSMakeRect(606.0, 244.0, 790.0, 470.0));
+  geometry_card.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+  [content_view addSubview:geometry_card];
 
-  transform_text_view_ = MakeTextView(NSMakeRect(16.0, 12.0, 758.0, 186.0));
-  transform_text_view_.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-  transform_text_view_.string = @"T_world_camera\n1.000  0.000  0.000  0.000\n0.000  1.000  0.000  0.000\n0.000  0.000  1.000  0.000\n0.000  0.000  0.000  1.000\n";
-  [transform_box.contentView addSubview:transform_text_view_];
+  NSTextField* geometry_title = MakeValueLabel(@"3D Reconstruction", 20.0,
+                                               [NSColor colorWithRed:0.94 green:0.95 blue:0.98 alpha:1.0]);
+  geometry_title.frame = NSMakeRect(20.0, 428.0, 300.0, 28.0);
+  geometry_title.autoresizingMask = NSViewMaxXMargin | NSViewMinYMargin;
+  [geometry_card addSubview:geometry_title];
 
-  NSBox* geometry_box = [[NSBox alloc] initWithFrame:NSMakeRect(606.0, 148.0, 790.0, 390.0)];
-  geometry_box.title = @"3D Reconstruction";
-  geometry_box.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-  [content_view addSubview:geometry_box];
+  NSTextField* geometry_caption =
+      MakeLabel(@"Interactive SceneKit viewport for the colored sparse map and camera pose",
+                DashboardFont(@"Avenir Next Medium", 13.0,
+                              [NSFont systemFontOfSize:13.0 weight:NSFontWeightMedium]));
+  geometry_caption.frame = NSMakeRect(20.0, 404.0, 520.0, 18.0);
+  geometry_caption.textColor = [NSColor colorWithRed:0.60 green:0.67 blue:0.73 alpha:1.0];
+  geometry_caption.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
+  [geometry_card addSubview:geometry_caption];
 
-  scene_view_ = [[SCNView alloc] initWithFrame:NSMakeRect(16.0, 16.0, 758.0, 340.0)];
+  scene_view_ = [[SCNView alloc] initWithFrame:NSMakeRect(20.0, 20.0, 750.0, 372.0)];
   scene_view_.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
   scene_view_.allowsCameraControl = YES;
   scene_view_.backgroundColor = [NSColor colorWithRed:0.08 green:0.09 blue:0.11 alpha:1.0];
-  [geometry_box.contentView addSubview:scene_view_];
+  scene_view_.wantsLayer = YES;
+  scene_view_.layer.cornerRadius = 14.0;
+  scene_view_.layer.masksToBounds = YES;
+  scene_view_.layer.borderWidth = 1.0;
+  scene_view_.layer.borderColor = CardBorderColor().CGColor;
+  [geometry_card addSubview:scene_view_];
+
+  NSView* map_card = MakeCardView(NSMakeRect(24.0, 90.0, 560.0, 136.0));
+  map_card.autoresizingMask = NSViewMaxXMargin | NSViewMinYMargin;
+  [content_view addSubview:map_card];
+
+  NSTextField* map_title = MakeValueLabel(@"Map Overview", 18.0,
+                                          [NSColor colorWithRed:0.94 green:0.95 blue:0.98 alpha:1.0]);
+  map_title.frame = NSMakeRect(20.0, 98.0, 220.0, 24.0);
+  map_title.autoresizingMask = NSViewMaxXMargin | NSViewMinYMargin;
+  [map_card addSubview:map_title];
+
+  NSTextField* map_caption = MakeLabel(@"Top-down diagnostic view of the recovered geometry",
+                                       DashboardFont(@"Avenir Next Medium", 12.0,
+                                                     [NSFont systemFontOfSize:12.0
+                                                                        weight:NSFontWeightMedium]));
+  map_caption.frame = NSMakeRect(20.0, 78.0, 320.0, 16.0);
+  map_caption.textColor = [NSColor colorWithRed:0.60 green:0.67 blue:0.73 alpha:1.0];
+  map_caption.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
+  [map_card addSubview:map_caption];
+
+  map_overview_view_ = MakeImageSurface(NSMakeRect(360.0, 16.0, 180.0, 104.0));
+  map_overview_view_.autoresizingMask = NSViewMinXMargin | NSViewHeightSizable;
+  [map_card addSubview:map_overview_view_];
+
+  NSView* transform_card = MakeCardView(NSMakeRect(606.0, 90.0, 790.0, 136.0));
+  transform_card.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
+  [content_view addSubview:transform_card];
+
+  NSTextField* transform_title = MakeValueLabel(@"Transforms", 18.0,
+                                                [NSColor colorWithRed:0.94 green:0.95 blue:0.98 alpha:1.0]);
+  transform_title.frame = NSMakeRect(20.0, 98.0, 220.0, 24.0);
+  transform_title.autoresizingMask = NSViewMaxXMargin | NSViewMinYMargin;
+  [transform_card addSubview:transform_title];
+
+  NSTextField* transform_caption = MakeLabel(@"Current world-to-camera pose matrix",
+                                             DashboardFont(@"Avenir Next Medium", 12.0,
+                                                           [NSFont systemFontOfSize:12.0
+                                                                              weight:NSFontWeightMedium]));
+  transform_caption.frame = NSMakeRect(20.0, 78.0, 260.0, 16.0);
+  transform_caption.textColor = [NSColor colorWithRed:0.60 green:0.67 blue:0.73 alpha:1.0];
+  transform_caption.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
+  [transform_card addSubview:transform_caption];
+
+  transform_text_view_ = MakeTextView(NSMakeRect(20.0, 14.0, 750.0, 56.0));
+  transform_text_view_.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+  transform_text_view_.string = @"T_world_camera\n1.000  0.000  0.000  0.000\n0.000  1.000  0.000  0.000\n0.000  0.000  1.000  0.000\n0.000  0.000  0.000  1.000\n";
+  [transform_card addSubview:transform_text_view_];
 
   SCNScene* scene = [SCNScene scene];
   scene_view_.scene = scene;
@@ -326,21 +576,25 @@ SCNGeometry* MakeLineGeometry(const std::vector<cv::Point3d>& trajectory) {
   floor.position = SCNVector3Make(0.0f, -1.0f, 0.0f);
   [scene.rootNode addChildNode:floor];
 
+  world_root_node_ = [SCNNode node];
   point_cloud_node_ = [SCNNode node];
   trajectory_node_ = [SCNNode node];
   tracked_camera_node_ = [SCNNode nodeWithGeometry:[SCNPyramid pyramidWithWidth:0.10
                                                                           height:0.08
                                                                           length:0.14]];
   tracked_camera_node_.geometry.firstMaterial.diffuse.contents = NSColor.systemRedColor;
-  [scene.rootNode addChildNode:point_cloud_node_];
-  [scene.rootNode addChildNode:trajectory_node_];
-  [scene.rootNode addChildNode:tracked_camera_node_];
+  [scene.rootNode addChildNode:world_root_node_];
+  [world_root_node_ addChildNode:point_cloud_node_];
+  [world_root_node_ addChildNode:trajectory_node_];
+  [world_root_node_ addChildNode:tracked_camera_node_];
 
-  status_label_ = MakeLabel(@"Opening camera…", [NSFont monospacedSystemFontOfSize:13.0
-                                                                             weight:NSFontWeightRegular]);
-  status_label_.frame = NSMakeRect(24.0, 36.0, 1372.0, 40.0);
+  status_label_ = MakeLabel(@"Opening camera…",
+                            [NSFont monospacedSystemFontOfSize:13.0
+                                                         weight:NSFontWeightRegular]);
+  status_label_.frame = NSMakeRect(24.0, 32.0, 1372.0, 32.0);
   status_label_.lineBreakMode = NSLineBreakByTruncatingTail;
   status_label_.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
+  status_label_.textColor = [NSColor colorWithRed:0.65 green:0.72 blue:0.78 alpha:1.0];
   [content_view addSubview:status_label_];
 
   [window_ makeKeyAndOrderFront:nil];
@@ -387,10 +641,24 @@ SCNGeometry* MakeLineGeometry(const std::vector<cv::Point3d>& trajectory) {
 
   const vslam::TrackingFrame tracked = tracker_.process(frame);
   image_view_.image = MatToImage(tracked.display_bgr.empty() ? frame : tracked.display_bgr);
+  map_overview_view_.image = MatToImage(tracked.geometry_bgr);
   transform_text_view_.string = MatrixString(tracked.stats.pose_matrix);
   point_cloud_node_.geometry = MakePointCloudGeometry(tracked.world_points);
   trajectory_node_.geometry = MakeLineGeometry(tracked.trajectory_points);
   tracked_camera_node_.transform = SceneMatrixFromPose(tracked.stats.pose_matrix);
+  const VisualizationBounds bounds = MakeVisualizationBounds(tracked);
+  world_root_node_.scale = SCNVector3Make(bounds.scale, bounds.scale, bounds.scale);
+  world_root_node_.position = SCNVector3Make(-bounds.center.x * bounds.scale,
+                                             -bounds.center.y * bounds.scale,
+                                             -bounds.center.z * bounds.scale);
+  tracking_value_label_.stringValue = [NSString stringWithUTF8String:tracked.stats.status.c_str()];
+  backend_value_label_.stringValue = tracked.stats.metal_enabled ? @"Metal + iSAM2" : @"CPU + iSAM2";
+  keypoints_value_label_.stringValue = [NSString stringWithFormat:@"%d", tracked.stats.keypoints];
+  matches_value_label_.stringValue = [NSString stringWithFormat:@"%d", tracked.stats.matches];
+  inliers_value_label_.stringValue = [NSString stringWithFormat:@"%d", tracked.stats.inliers];
+  keyframes_value_label_.stringValue = [NSString stringWithFormat:@"%d", tracked.stats.keyframes];
+  cloud_value_label_.stringValue = [NSString stringWithFormat:@"%d", tracked.stats.map_points];
+  travel_value_label_.stringValue = [NSString stringWithFormat:@"%.2f", tracked.stats.translation_norm];
   status_label_.stringValue = StatusString(tracked.stats, "");
 }
 

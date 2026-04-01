@@ -44,7 +44,8 @@ NSString* StatusString(const vslam::TrackingStats& stats, const std::string& met
   stream.setf(std::ios::fixed);
   stream.precision(3);
   stream << "status: " << stats.status << "    metal: " << (stats.metal_enabled ? "on" : "cpu")
-         << "    keypoints: " << stats.keypoints << "    matches: " << stats.matches
+         << "    keypoints: " << stats.keypoints << "    keyframes: " << stats.keyframes
+         << "    matches: " << stats.matches
          << "    inliers: " << stats.inliers << "    map: " << stats.map_points
          << "    travel: " << stats.translation_norm;
   if (!metal_error.empty() && !stats.metal_enabled) {
@@ -116,20 +117,36 @@ SCNMatrix4 SceneMatrixFromPose(const cv::Matx44d& pose) {
   return matrix;
 }
 
-SCNGeometry* MakePointCloudGeometry(const std::vector<cv::Point3d>& points) {
+SCNGeometry* MakePointCloudGeometry(const std::vector<vslam::ColoredPoint>& points) {
   if (points.empty()) {
     return nil;
   }
 
   std::vector<SCNVector3> vertices;
+  std::vector<SCNVector4> colors;
   vertices.reserve(points.size());
+  colors.reserve(points.size());
   for (const auto& point : points) {
-    vertices.push_back(SCNVector3Make(static_cast<float>(point.x), static_cast<float>(point.y),
-                                      static_cast<float>(point.z)));
+    vertices.push_back(SCNVector3Make(static_cast<float>(point.position.x),
+                                      static_cast<float>(point.position.y),
+                                      static_cast<float>(point.position.z)));
+    colors.push_back(SCNVector4Make(static_cast<float>(point.bgr[2]) / 255.0f,
+                                    static_cast<float>(point.bgr[1]) / 255.0f,
+                                    static_cast<float>(point.bgr[0]) / 255.0f, 1.0f));
   }
 
-  SCNGeometrySource* source =
+  SCNGeometrySource* vertex_source =
       [SCNGeometrySource geometrySourceWithVertices:vertices.data() count:vertices.size()];
+  NSData* color_data = [NSData dataWithBytes:colors.data() length:colors.size() * sizeof(SCNVector4)];
+  SCNGeometrySource* color_source =
+      [SCNGeometrySource geometrySourceWithData:color_data
+                                       semantic:SCNGeometrySourceSemanticColor
+                                    vectorCount:colors.size()
+                                floatComponents:YES
+                              componentsPerVector:4
+                                bytesPerComponent:sizeof(float)
+                                      dataOffset:0
+                                      dataStride:sizeof(SCNVector4)];
 
   std::vector<uint32_t> indices(vertices.size());
   for (uint32_t index = 0; index < indices.size(); ++index) {
@@ -143,12 +160,14 @@ SCNGeometry* MakePointCloudGeometry(const std::vector<cv::Point3d>& points) {
                                     primitiveCount:indices.size()
                                      bytesPerIndex:sizeof(uint32_t)];
   element.pointSize = 6.0;
-  element.minimumPointScreenSpaceRadius = 3.0;
-  element.maximumPointScreenSpaceRadius = 8.0;
+  element.minimumPointScreenSpaceRadius = 4.0;
+  element.maximumPointScreenSpaceRadius = 10.0;
 
-  SCNGeometry* geometry = [SCNGeometry geometryWithSources:@[ source ] elements:@[ element ]];
+  SCNGeometry* geometry =
+      [SCNGeometry geometryWithSources:@[ vertex_source, color_source ] elements:@[ element ]];
   geometry.firstMaterial.lightingModelName = SCNLightingModelConstant;
-  geometry.firstMaterial.diffuse.contents = NSColor.systemOrangeColor;
+  geometry.firstMaterial.diffuse.contents = NSColor.whiteColor;
+  geometry.firstMaterial.doubleSided = YES;
   return geometry;
 }
 
@@ -184,7 +203,7 @@ SCNGeometry* MakeLineGeometry(const std::vector<cv::Point3d>& trajectory) {
 
   SCNGeometry* geometry = [SCNGeometry geometryWithSources:@[ source ] elements:@[ element ]];
   geometry.firstMaterial.lightingModelName = SCNLightingModelConstant;
-  geometry.firstMaterial.diffuse.contents = NSColor.systemGreenColor;
+  geometry.firstMaterial.diffuse.contents = [NSColor colorWithRed:0.18 green:0.92 blue:0.42 alpha:1.0];
   return geometry;
 }
 
@@ -304,6 +323,7 @@ SCNGeometry* MakeLineGeometry(const std::vector<cv::Point3d>& trajectory) {
   SCNNode* floor = [SCNNode nodeWithGeometry:[SCNFloor floor]];
   floor.geometry.firstMaterial.diffuse.contents = [NSColor colorWithWhite:0.18 alpha:1.0];
   floor.geometry.firstMaterial.lightingModelName = SCNLightingModelConstant;
+  floor.position = SCNVector3Make(0.0f, -1.0f, 0.0f);
   [scene.rootNode addChildNode:floor];
 
   point_cloud_node_ = [SCNNode node];

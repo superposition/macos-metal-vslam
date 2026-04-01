@@ -12,6 +12,11 @@
 
 namespace vslam {
 
+struct ColoredPoint {
+  cv::Point3d position;
+  cv::Vec3b bgr = cv::Vec3b(255, 255, 255);
+};
+
 struct TrackingStats {
   bool initialized = false;
   bool pose_updated = false;
@@ -29,7 +34,7 @@ struct TrackingStats {
 struct TrackingFrame {
   cv::Mat display_bgr;
   cv::Mat geometry_bgr;
-  std::vector<cv::Point3d> world_points;
+  std::vector<ColoredPoint> world_points;
   std::vector<cv::Point3d> trajectory_points;
   TrackingStats stats;
 };
@@ -45,6 +50,7 @@ class MonocularTracker {
   struct Keyframe {
     int frame_index = 0;
     cv::Matx44d T_w_c = cv::Matx44d::eye();
+    cv::Mat image_bgr;
     std::vector<cv::KeyPoint> keypoints;
     cv::Mat descriptors;
   };
@@ -66,7 +72,7 @@ class MonocularTracker {
   bool has_active_keyframe_ = false;
   Keyframe active_keyframe_;
   std::vector<cv::Point3d> trajectory_history_;
-  std::vector<cv::Point3d> map_points_world_;
+  std::vector<ColoredPoint> map_points_world_;
 };
 
 }  // namespace vslam

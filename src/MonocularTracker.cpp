@@ -23,6 +23,16 @@ cv::Matx44d ComposePose(const cv::Mat& rotation, const cv::Mat& translation) {
   return pose;
 }
 
+cv::Vec3b SampleColorAt(const cv::Mat& image_bgr, const cv::Point2f& point) {
+  if (image_bgr.empty() || image_bgr.type() != CV_8UC3) {
+    return cv::Vec3b(255, 255, 255);
+  }
+
+  const int x = std::clamp(static_cast<int>(std::lround(point.x)), 0, image_bgr.cols - 1);
+  const int y = std::clamp(static_cast<int>(std::lround(point.y)), 0, image_bgr.rows - 1);
+  return image_bgr.at<cv::Vec3b>(y, x);
+}
+
 std::vector<cv::DMatch> RatioTestMatches(const cv::BFMatcher& matcher,
                                          const cv::Mat& previous_descriptors,
                                          const cv::Mat& current_descriptors) {
@@ -105,7 +115,7 @@ bool ShouldCreateKeyframe(int frames_since_keyframe, double baseline, double med
   return baseline > 0.35 || median_pixel_motion > 36.0;
 }
 
-cv::Mat RenderGeometryView(const std::vector<cv::Point3d>& points,
+cv::Mat RenderGeometryView(const std::vector<ColoredPoint>& points,
                            const std::vector<cv::Point3d>& trajectory) {
   cv::Mat canvas(520, 640, CV_8UC3, cv::Scalar(20, 22, 28));
   cv::rectangle(canvas, cv::Rect(0, 0, canvas.cols - 1, canvas.rows - 1),
@@ -125,10 +135,10 @@ cv::Mat RenderGeometryView(const std::vector<cv::Point3d>& points,
   double max_z = 1.0;
 
   for (const auto& point : points) {
-    min_x = std::min(min_x, point.x);
-    max_x = std::max(max_x, point.x);
-    min_z = std::min(min_z, point.z);
-    max_z = std::max(max_z, point.z);
+    min_x = std::min(min_x, point.position.x);
+    max_x = std::max(max_x, point.position.x);
+    min_z = std::min(min_z, point.position.z);
+    max_z = std::max(max_z, point.position.z);
   }
   for (const auto& point : trajectory) {
     min_x = std::min(min_x, point.x);
@@ -157,9 +167,10 @@ cv::Mat RenderGeometryView(const std::vector<cv::Point3d>& points,
            cv::Scalar(45, 90, 120), 1, cv::LINE_AA);
 
   for (const auto& point : points) {
-    const cv::Point projected = project(point.x, point.z);
+    const cv::Point projected = project(point.position.x, point.position.z);
     if (plot.contains(projected)) {
-      cv::circle(canvas, projected, 2, cv::Scalar(255, 170, 70), cv::FILLED, cv::LINE_AA);
+      const cv::Scalar color(point.bgr[0], point.bgr[1], point.bgr[2]);
+      cv::circle(canvas, projected, 2, color, cv::FILLED, cv::LINE_AA);
     }
   }
 
@@ -186,8 +197,9 @@ void DrawTrackedPoints(cv::Mat& image,
   }
 }
 
-std::vector<cv::Point3d> TriangulatePositiveDepthPoints(
+std::vector<ColoredPoint> TriangulatePositiveDepthPoints(
     const cv::Matx33d& camera_matrix, const cv::Matx33d& rotation, const cv::Vec3d& translation,
+    const cv::Mat& source_image_bgr,
     const std::vector<cv::Point2f>& previous_points,
     const std::vector<cv::Point2f>& current_points) {
   if (previous_points.size() < 8 || current_points.size() < 8) {
@@ -211,7 +223,7 @@ std::vector<cv::Point3d> TriangulatePositiveDepthPoints(
   cv::triangulatePoints(camera_matrix * projection_prev, camera_matrix * projection_curr,
                         previous_points, current_points, homogeneous_points);
 
-  std::vector<cv::Point3d> positive_depth_points;
+  std::vector<ColoredPoint> positive_depth_points;
   positive_depth_points.reserve(std::min(homogeneous_points.cols, 1200));
   for (int col = 0; col < homogeneous_points.cols; ++col) {
     const double w = homogeneous_points.at<double>(3, col);
@@ -242,20 +254,20 @@ std::vector<cv::Point3d> TriangulatePositiveDepthPoints(
       if (reproj_error > 2.5) {
         continue;
       }
-      positive_depth_points.emplace_back(x, y, z);
+      positive_depth_points.push_back({cv::Point3d(x, y, z), SampleColorAt(source_image_bgr, previous_points[col])});
     }
   }
   return positive_depth_points;
 }
 
-std::vector<cv::Point3d> TransformPointsToWorld(const std::vector<cv::Point3d>& camera_points,
-                                                const cv::Matx44d& T_w_c) {
-  std::vector<cv::Point3d> world_points;
+std::vector<ColoredPoint> TransformPointsToWorld(const std::vector<ColoredPoint>& camera_points,
+                                                 const cv::Matx44d& T_w_c) {
+  std::vector<ColoredPoint> world_points;
   world_points.reserve(camera_points.size());
   for (const auto& point : camera_points) {
-    const cv::Vec4d homogeneous(point.x, point.y, point.z, 1.0);
+    const cv::Vec4d homogeneous(point.position.x, point.position.y, point.position.z, 1.0);
     const cv::Vec4d world = T_w_c * homogeneous;
-    world_points.emplace_back(world[0], world[1], world[2]);
+    world_points.push_back({cv::Point3d(world[0], world[1], world[2]), point.bgr});
   }
   return world_points;
 }
@@ -352,6 +364,7 @@ TrackingFrame MonocularTracker::process(const cv::Mat& frame_bgr) {
     if (!has_active_keyframe_ && !descriptors.empty() && keypoints.size() >= 80) {
       active_keyframe_.frame_index = frame_index_;
       active_keyframe_.T_w_c = T_c_w_.inv();
+      active_keyframe_.image_bgr = frame_bgr.clone();
       active_keyframe_.keypoints = keypoints;
       active_keyframe_.descriptors = descriptors.clone();
       has_active_keyframe_ = true;
@@ -434,7 +447,7 @@ TrackingFrame MonocularTracker::process(const cv::Mat& frame_bgr) {
                               trajectory_history_.begin() + (trajectory_history_.size() - 512));
   }
 
-  std::vector<cv::Point3d> triangulated_world_points;
+  std::vector<ColoredPoint> triangulated_world_points;
   if (has_active_keyframe_ && !active_keyframe_.descriptors.empty()) {
     const std::vector<cv::DMatch> keyframe_matches =
         RatioTestMatches(matcher_, active_keyframe_.descriptors, descriptors);
@@ -449,18 +462,18 @@ TrackingFrame MonocularTracker::process(const cv::Mat& frame_bgr) {
     const double keyframe_motion = MedianPixelMotion(keyframe_points, current_keyframe_points);
 
     if (keyframe_matches.size() >= 32 && keyframe_baseline > 0.12 && keyframe_motion > 14.0) {
-      const std::vector<cv::Point3d> keyframe_points_3d = TriangulatePositiveDepthPoints(
-          camera_matrix_, RotationFromPose(T_c_k), keyframe_translation, keyframe_points,
+      const std::vector<ColoredPoint> keyframe_points_3d = TriangulatePositiveDepthPoints(
+          camera_matrix_, RotationFromPose(T_c_k), keyframe_translation, active_keyframe_.image_bgr, keyframe_points,
           current_keyframe_points);
       triangulated_world_points =
           TransformPointsToWorld(keyframe_points_3d, active_keyframe_.T_w_c);
-      result.stats.map_points = static_cast<int>(triangulated_world_points.size());
     }
 
     const int frames_since_keyframe = frame_index_ - active_keyframe_.frame_index;
     if (ShouldCreateKeyframe(frames_since_keyframe, keyframe_baseline, keyframe_motion, inlier_count)) {
       active_keyframe_.frame_index = frame_index_;
       active_keyframe_.T_w_c = T_w_c;
+      active_keyframe_.image_bgr = frame_bgr.clone();
       active_keyframe_.keypoints = keypoints;
       active_keyframe_.descriptors = descriptors.clone();
       result.stats.status = "Tracking + keyframe";
@@ -468,6 +481,7 @@ TrackingFrame MonocularTracker::process(const cv::Mat& frame_bgr) {
   } else {
     active_keyframe_.frame_index = frame_index_;
     active_keyframe_.T_w_c = T_w_c;
+    active_keyframe_.image_bgr = frame_bgr.clone();
     active_keyframe_.keypoints = keypoints;
     active_keyframe_.descriptors = descriptors.clone();
     has_active_keyframe_ = true;
@@ -483,6 +497,7 @@ TrackingFrame MonocularTracker::process(const cv::Mat& frame_bgr) {
     map_points_world_.erase(map_points_world_.begin(),
                             map_points_world_.begin() + (map_points_world_.size() - 6000));
   }
+  result.stats.map_points = static_cast<int>(map_points_world_.size());
   result.stats.keyframes = has_active_keyframe_ ? 1 : 0;
   result.geometry_bgr = RenderGeometryView(map_points_world_, trajectory_history_);
   result.world_points = map_points_world_;

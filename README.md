@@ -27,10 +27,10 @@ That keeps the repo native to Apple Silicon without locking the SLAM logic into 
 
 - native macOS window with live camera feed
 - transform panel showing the current camera pose matrix
-- SceneKit viewport for sparse world points and camera trajectory
+- SceneKit viewport for a colored sparse world point cloud and camera trajectory
 - ORB feature extraction and matching
 - monocular relative pose estimation with OpenCV
-- lightweight keyframe-based triangulation for richer sparse reconstruction
+- lightweight keyframe-based triangulation that preserves webcam color on world points
 - sparse triangulation count for map bootstrap feedback
 - Metal-accelerated BGR-to-luma preprocessing with CPU fallback
 - CMake build for Apple Silicon
